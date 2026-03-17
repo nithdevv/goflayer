@@ -1,302 +1,356 @@
-// Package bot implements the core Minecraft bot.
+// Package bot предоставляет главный Bot для Minecraft.
 package bot
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"sync"
+	"time"
 
-	"github.com/nithdevv/goflayer/pkg/event"
-	"github.com/nithdevv/goflayer/pkg/plugins"
-	"github.com/nithdevv/goflayer/pkg/protocol"
-	"github.com/nithdevv/goflayer/pkg/protocol/states"
+	"github.com/nithdevv/goflayer/internal/conn"
+	"github.com/nithdevv/goflayer/internal/logger"
+	"github.com/nithdevv/goflayer/internal/protocol"
+	"github.com/nithdevv/goflayer/internal/session"
+	"github.com/nithdevv/goflayer/internal/types"
+	"github.com/nithdevv/goflayer/internal/worker"
+	"github.com/nithdevv/goflayer/pkg/events"
 )
 
-// botImpl implements the Bot interface.
-type botImpl struct {
-	// Configuration
-	options *Options
+// Bot represents a Minecraft bot.
+type Bot struct {
+	mu     sync.RWMutex
+	config types.BotConfig
 
-	// Protocol client
-	client *protocol.Client
+	// Components
+	conn    *conn.Conn
+	session *session.Manager
+	worker  *worker.Pool
+	events  *events.Bus
 
-	// Event bus
-	events *event.Bus
+	// Lifecycle
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	running  bool
 
-	// Plugins
-	plugins      map[string]plugins.Plugin
-	pluginsMu    sync.RWMutex
-	pluginLoader *plugins.Loader
-
-	// State
-	connected bool
-	mu        sync.RWMutex
-
-	// Context
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	// Logger
+	log *logger.Logger
 }
 
-// Options holds bot configuration.
-type Options struct {
-	// Host is the server address.
-	Host string
-
-	// Port is the server port.
-	Port int
-
-	// Username is the bot's username.
-	Username string
-
-	// Password is the bot's password (optional, for online auth).
-	Password string
-
-	// Version is the Minecraft version to connect to.
-	Version string
-
-	// Auth is the authentication type ("offline" or "microsoft").
-	Auth string
-
-	// Plugins are plugins to load on startup.
-	Plugins map[string]plugins.Plugin
-}
-
-// New creates a new bot with the given options.
-func New(options *Options) (Bot, error) {
-	if options == nil {
-		return nil, fmt.Errorf("options cannot be nil")
+// New creates a new bot with the given configuration.
+func New(config types.BotConfig) (*Bot, error) {
+	// Validate config
+	if err := validateConfig(&config); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	// Set defaults
-	if options.Version == "" {
-		options.Version = "1.20.1"
-	}
-	if options.Auth == "" {
-		options.Auth = "offline"
-	}
+	// Initialize logger
+	logger.Init(os.Stdout, logger.INFO)
+
+	log := logger.Default().With("bot")
+	log.Info("Initializing bot...")
+	log.Debug("Server: %s:%d", config.Server.Host, config.Server.Port)
+	log.Debug("Username: %s", config.Player.Username)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	bot := &botImpl{
-		options:     options,
-		events:      event.NewBus(),
-		plugins:     make(map[string]plugins.Plugin),
-		ctx:         ctx,
-		cancel:      cancel,
+	// Create event bus
+	ev := events.NewBus()
+
+	// Create connection manager
+	c := conn.New(
+		config.Server.Host,
+		config.Server.Port,
+		config.ReadTimeout,
+		ev,
+	)
+
+	// Create session manager
+	sess := session.New(c, config.Player.Username, config.Server.Protocol, ev)
+
+	// Create worker pool (packet processor wraps session)
+	wp := worker.New(config.WorkerCount, &packetProcessor{session: sess})
+
+	bot := &Bot{
+		config:  config,
+		conn:    c,
+		session: sess,
+		worker:  wp,
+		events:  ev,
+		ctx:     ctx,
+		cancel:  cancel,
+		log:     log,
 	}
 
-	// Create protocol client
-	bot.client = protocol.NewClient(protocol.Config{
-		Host:            options.Host,
-		Port:            options.Port,
-		Version:         options.Version,
-		ProtocolVersion: 763, // 1.20.1
-	})
-
-	// Create plugin loader
-	bot.pluginLoader = plugins.NewLoader(bot)
-
+	log.Info("Bot initialized successfully")
 	return bot, nil
 }
 
-// Connect connects to the server.
-func (b *botImpl) Connect(ctx context.Context) error {
+// validateConfig validates the bot configuration.
+func validateConfig(cfg *types.BotConfig) error {
+	if cfg.Server.Host == "" {
+		return fmt.Errorf("server host is required")
+	}
+	if cfg.Server.Port <= 0 || cfg.Server.Port > 65535 {
+		return fmt.Errorf("invalid server port: %d", cfg.Server.Port)
+	}
+	if cfg.Player.Username == "" {
+		return fmt.Errorf("username is required")
+	}
+	return nil
+}
+
+// Connect connects the bot to the server.
+func (b *Bot) Connect(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.connected {
-		return fmt.Errorf("already connected")
+	if b.running {
+		return fmt.Errorf("already running")
 	}
 
-	// Connect protocol client
-	if err := b.client.Connect(ctx); err != nil {
-		return fmt.Errorf("failed to connect: %w", err)
+	b.log.Info("Connecting to server...")
+
+	// Start worker pool
+	if err := b.worker.Start(b.ctx); err != nil {
+		return fmt.Errorf("failed to start worker pool: %w", err)
 	}
 
-	// Perform handshake
-	if err := b.handshake(); err != nil {
-		b.client.Disconnect()
-		return fmt.Errorf("handshake failed: %w", err)
+	// Connect to server
+	if err := b.conn.Connect(ctx); err != nil {
+		b.worker.Stop()
+		return fmt.Errorf("connection failed: %w", err)
 	}
 
-	// Start packet processing
+	// Start packet reader
 	b.wg.Add(1)
-	go b.processPackets()
+	go b.packetReader()
 
-	// Load plugins
-	if err := b.loadPlugins(); err != nil {
-		b.client.Disconnect()
-		return fmt.Errorf("failed to load plugins: %w", err)
+	// Start session (handshake + login)
+	if err := b.session.Start(
+		b.config.Server.Host,
+		uint16(b.config.Server.Port),
+	); err != nil {
+		b.conn.Close()
+		b.worker.Stop()
+		return fmt.Errorf("session failed: %w", err)
 	}
 
-	b.connected = true
-
-	// Emit connected event
+	b.running = true
+	b.log.Info("Bot connected and running")
 	b.events.Emit("connected")
 
 	return nil
 }
 
-// Disconnect disconnects from the server.
-func (b *botImpl) Disconnect() error {
+// Disconnect disconnects the bot from the server.
+func (b *Bot) Disconnect() error {
 	b.mu.Lock()
-	if !b.connected {
-		b.mu.Unlock()
-		return fmt.Errorf("not connected")
+	defer b.mu.Unlock()
+
+	if !b.running {
+		return nil
 	}
-	b.connected = false
-	b.mu.Unlock()
 
-	// Unload plugins
-	b.unloadPlugins()
+	b.log.Info("Disconnecting...")
 
-	// Cancel context
+	// Signal shutdown
 	b.cancel()
+
+	// Close session
+	b.session.Close()
+
+	// Stop worker pool
+	b.worker.Stop()
+
+	// Close connection
+	b.conn.Close()
 
 	// Wait for goroutines
 	b.wg.Wait()
 
-	// Disconnect client
-	if err := b.client.Disconnect(); err != nil {
-		return err
-	}
-
-	// Emit disconnected event
+	b.running = false
+	b.log.Info("Disconnected")
 	b.events.Emit("disconnected")
 
 	return nil
 }
 
-// handshake performs the login handshake.
-func (b *botImpl) handshake() error {
-	// Send handshake packet
-	// TODO: Implement handshake
-
-	// Transition to login state
-	if err := b.client.SetState(states.Login); err != nil {
-		return err
-	}
-
-	// Send login start packet
-	// TODO: Implement login
-
-	// Wait for login success
-	// TODO: Implement login handling
-
-	// Transition to play state
-	if err := b.client.SetState(states.Play); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// loadPlugins loads all configured plugins.
-func (b *botImpl) loadPlugins() error {
-	// Load configured plugins
-	if b.options.Plugins != nil {
-		for name, plugin := range b.options.Plugins {
-			if err := b.pluginLoader.Load(plugin); err != nil {
-				return fmt.Errorf("failed to load plugin %s: %w", name, err)
-			}
-			b.plugins[name] = plugin
-		}
-	}
-	return nil
-}
-
-// unloadPlugins unloads all plugins.
-func (b *botImpl) unloadPlugins() {
-	b.pluginsMu.Lock()
-	defer b.pluginsMu.Unlock()
-
-	for name, plugin := range b.plugins {
-		if err := plugin.Unload(); err != nil {
-			// Log error but continue
-			_ = err
-		}
-		delete(b.plugins, name)
-	}
-}
-
-// processPackets processes incoming packets.
-func (b *botImpl) processPackets() {
+// packetReader reads packets from the connection.
+func (b *Bot) packetReader() {
 	defer b.wg.Done()
+	b.log.Debug("Packet reader started")
+
+	defer func() {
+		if r := recover(); r != nil {
+			b.log.Error("Packet reader panic: %v", r)
+		}
+	}()
 
 	for {
 		select {
 		case <-b.ctx.Done():
+			b.log.Debug("Packet reader stopped by context")
 			return
-		case packet := <-b.client.Incoming():
-			if packet == nil {
+
+		default:
+			pkt, err := b.readPacket()
+			if err != nil {
+				if !b.isContextCancelled() {
+					b.log.Error("Failed to read packet: %v", err)
+					b.handleConnectionError(err)
+				}
 				return
 			}
 
-			// Emit packet event
-			b.events.Emit("packet", packet)
-
-			// Handle packet
-			b.handlePacket(packet)
+			// Submit to worker pool
+			if err := b.worker.Submit(pkt); err != nil {
+				b.log.Error("Failed to submit packet: %v", err)
+			}
 		}
 	}
 }
 
-// handlePacket handles an incoming packet.
-func (b *botImpl) handlePacket(packet *protocol.Packet) {
-	// Emit specific packet event
-	packetEvent := fmt.Sprintf("packet:%d", packet.ID)
-	b.events.Emit(packetEvent, packet)
+// readPacket reads a single packet from the connection.
+func (b *Bot) readPacket() (*protocol.Packet, error) {
+	// Read packet length (VarInt)
+	r := protocol.NewReader(b.conn)
+	length, err := r.ReadVarInt()
+	if err != nil {
+		return nil, fmt.Errorf("read length: %w", err)
+	}
+
+	if length < 0 {
+		return nil, fmt.Errorf("invalid length: %d", length)
+	}
+
+	if length > 0x200000 { // 2MB limit
+		return nil, fmt.Errorf("packet too large: %d", length)
+	}
+
+	// Read packet data
+	data := make([]byte, length)
+	_, err = b.conn.Read(data)
+	if err != nil {
+		return nil, fmt.Errorf("read data: %w", err)
+	}
+
+	// Parse packet ID
+	packetReader := protocol.NewReader(bytes.NewReader(data))
+	packetID, err := packetReader.ReadVarInt()
+	if err != nil {
+		return nil, fmt.Errorf("read packet ID: %w", err)
+	}
+
+	pkt := &protocol.Packet{
+		ID:    packetID,
+		Data:  data,
+		State: b.session.GetState(),
+	}
+
+	b.log.Debug("Read packet 0x%02X (%d bytes)", pkt.ID, length)
+
+	return pkt, nil
 }
 
-// On subscribes to an event.
-// Returns a subscription that can be used to unsubscribe.
-func (b *botImpl) On(event string, handler func(...interface{})) event.Subscription {
+// handleConnectionError handles a connection error.
+func (b *Bot) handleConnectionError(err error) {
+	b.events.Emit("error", err)
+
+	if b.config.EnableReconnect {
+		b.log.Warn("Connection lost, attempting to reconnect...")
+		b.wg.Add(1)
+		go b.reconnect()
+	}
+}
+
+// reconnect attempts to reconnect to the server.
+func (b *Bot) reconnect() {
+	defer b.wg.Done()
+
+	delay := b.config.ReconnectDelay
+	attempts := 0
+
+	for attempts < b.config.MaxReconnects {
+		if b.isContextCancelled() {
+			return
+		}
+
+		attempts++
+		b.log.Info("Reconnect attempt %d/%d", attempts, b.config.MaxReconnects)
+
+		time.Sleep(delay)
+
+		ctx, cancel := context.WithTimeout(b.ctx, b.config.ConnectTimeout)
+		err := b.conn.Connect(ctx)
+		cancel()
+
+		if err == nil {
+			b.log.Info("Reconnected successfully")
+			b.conn.IncrementReconnects()
+
+			// Restart session
+			if err := b.session.Start(
+				b.config.Server.Host,
+				uint16(b.config.Server.Port),
+			); err != nil {
+				b.log.Error("Failed to restart session: %v", err)
+				b.conn.Close()
+			} else {
+				return
+			}
+		}
+
+		delay = time.Duration(float64(delay) * b.config.ReconnectBackoff)
+	}
+
+	b.log.Error("Failed to reconnect after %d attempts", attempts)
+	b.events.Emit("reconnect_failed")
+}
+
+// isContextCancelled checks if context is cancelled.
+func (b *Bot) isContextCancelled() bool {
+	select {
+	case <-b.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// IsConnected returns true if the bot is connected.
+func (b *Bot) IsConnected() bool {
+	return b.conn.IsConnected()
+}
+
+// On subscribes to an event (convenience method).
+func (b *Bot) On(event string, handler func(...interface{})) *events.Subscription {
 	return b.events.Subscribe(event, handler)
 }
 
-// Emit emits an event.
-func (b *botImpl) Emit(event string, data ...interface{}) {
+// Emit emits an event (convenience method).
+func (b *Bot) Emit(event string, data ...interface{}) {
 	b.events.Emit(event, data...)
 }
 
-// Chat sends a chat message.
-func (b *botImpl) Chat(message string) error {
-	b.mu.RLock()
-	connected := b.connected
-	b.mu.RUnlock()
-
-	if !connected {
-		return fmt.Errorf("not connected")
-	}
-
-	// TODO: Implement chat packet
-	return nil
-}
-
 // Events returns the event bus.
-func (b *botImpl) Events() *event.Bus {
+func (b *Bot) Events() *events.Bus {
 	return b.events
 }
 
-// Client returns the protocol client.
-func (b *botImpl) Client() *protocol.Client {
-	return b.client
+// Config returns the bot configuration.
+func (b *Bot) Config() *types.BotConfig {
+	return &b.config
 }
 
-// IsConnected returns true if connected to the server.
-func (b *botImpl) IsConnected() bool {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.connected
+// packetProcessor processes packets by forwarding to session.
+type packetProcessor struct {
+	session *session.Manager
 }
 
-// Username returns the bot's username.
-func (b *botImpl) Username() string {
-	return b.options.Username
-}
-
-// Options returns the bot options.
-func (b *botImpl) Options() *Options {
-	return b.options
+func (p *packetProcessor) Process(pkt *protocol.Packet) error {
+	p.session.HandlePacket(pkt)
+	return nil
 }
