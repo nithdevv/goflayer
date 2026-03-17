@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"github.com/nithdevv/goflayer/pkg/event"
+	"github.com/nithdevv/goflayer/pkg/protocol"
 )
 
 // Bot is a minimal interface for plugins to interact with the bot.
@@ -9,6 +10,7 @@ import (
 type Bot interface {
 	On(event string, handler func(...interface{})) event.Subscription
 	Emit(event string, data ...interface{})
+	Client() *protocol.Client
 }
 
 // BasePlugin provides a base implementation for plugins.
