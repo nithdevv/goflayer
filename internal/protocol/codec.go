@@ -336,6 +336,54 @@ func (w *Writer) WriteRaw(data []byte) {
 	w.buf = append(w.buf, data...)
 }
 
+// ReadDouble reads a big-endian float64.
+func (r *Reader) ReadDouble() (float64, error) {
+	bits, err := r.ReadUint64()
+	if err != nil {
+		return 0, err
+	}
+	return math.Float64frombits(bits), nil
+}
+
+// WriteDouble writes a big-endian float64.
+func (w *Writer) WriteDouble(v float64) {
+	w.WriteFloat64(v)
+}
+
+// ReadBlockPos reads a block position.
+func (r *Reader) ReadBlockPos() (*BlockPos, error) {
+	x, err := r.ReadInt64()
+	if err != nil {
+		return nil, err
+	}
+
+	return &BlockPos{
+		x: int32(x >> 38),
+		y: int32((x << 52) >> 52),
+		z: int32((x << 26) >> 38),
+	}, nil
+}
+
+// BlockPos represents a position in the world.
+type BlockPos struct {
+	x, y, z int32
+}
+
+// X returns the X coordinate.
+func (b *BlockPos) X() int32 {
+	return b.x
+}
+
+// Y returns the Y coordinate.
+func (b *BlockPos) Y() int32 {
+	return b.y
+}
+
+// Z returns the Z coordinate.
+func (b *BlockPos) Z() int32 {
+	return b.z
+}
+
 // VarIntSize returns the size of a VarInt in bytes.
 func VarIntSize(v int32) int {
 	uv := uint32(v)
