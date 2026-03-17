@@ -1,3 +1,3 @@
-module github.com/go-flayer/goflayer
+module github.com/nithdevv/goflayer
 
-go 1.24.5
+go 1.21

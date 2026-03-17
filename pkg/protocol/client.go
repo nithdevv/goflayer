@@ -1,122 +1,131 @@
 package protocol
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"net"
 	"sync"
-	"time"
+
+	"github.com/nithdevv/goflayer/pkg/event"
+	"github.com/nithdevv/goflayer/pkg/net/conn"
+	"github.com/nithdevv/goflayer/pkg/protocol/codec"
+	"github.com/nithdevv/goflayer/pkg/protocol/states"
+)
+
+var (
+	ErrAlreadyConnected = errors.New("already connected")
+	ErrNotConnected     = errors.New("not connected")
+	ErrInvalidState     = errors.New("invalid state transition")
 )
 
 // Client represents a Minecraft protocol client.
-//
-// Client handles the low-level protocol communication with a Minecraft server.
-// It manages packet serialization/deserialization, compression, encryption,
-// and protocol state transitions.
+// It handles the low-level protocol communication with a Minecraft server.
 type Client struct {
 	// Connection
-	conn        net.Conn
-	host        string
-	port        int
-	connMu      sync.Mutex
+	conn *conn.Conn
+	host string
+	port int
 
 	// Protocol state
-	state          State
-	connState      *ConnectionState
-	version        string
-	protocolVersion int
-	stateMu        sync.RWMutex
+	state        states.State
+	version      string
+	protocolVer  int
+	stateMu      sync.RWMutex
 
-	// Processing
-	serializer     *Serializer
-	deserializer   *Deserializer
-	compressor     Compressor
-	encryptor      Encryptor
+	// Compression
+	compressionThreshold int
+	compressionMu        sync.RWMutex
 
-	// Packet handling
-	packetRegistry *PacketRegistry
-	handlers       map[string][]*handlerWrapper
-	handlersMu     sync.RWMutex
-	nextHandlerID  uint64
+	// Encryption
+	encryptionEnabled bool
 
-	// Channels
-	packetChan chan *Packet
-	errorChan  chan error
+	// Event bus
+	events *event.Bus
+
+	// Packet handlers
+	handlersMu sync.RWMutex
+	handlers   map[states.State]map[int32][]*handlerWrapper
+	nextID    uint64
 
 	// Context
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	// Metrics
-	latency       time.Duration
-	lastKeepAlive time.Time
+	// Incoming packets
+	incoming chan *Packet
 
-	// Configuration
-	hideErrors           bool
-	compressionThreshold int
+	// Read loop control
+	readLoopDone chan struct{}
 }
 
-// ClientConfig contains configuration for creating a client.
-type ClientConfig struct {
-	// Version is the Minecraft version to connect to.
-	// If empty, version will be auto-detected during handshake.
-	Version string
-
-	// HideErrors suppresses error logging.
-	HideErrors bool
-
-	// CompressionThreshold is the packet size threshold for compression.
-	// Packets larger than this will be compressed. -1 to disable compression.
+// Config holds client configuration.
+type Config struct {
+	Host                 string
+	Port                 int
+	Version              string
+	ProtocolVersion      int
 	CompressionThreshold int
 }
 
-// NewClient creates a new Minecraft protocol client.
-func NewClient(config ClientConfig) *Client {
+// NewClient creates a new protocol client.
+func NewClient(config Config) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &Client{
-		state:               Handshaking,
-		connState:           NewConnectionState(),
-		version:             config.Version,
-		handlers:            make(map[string][]*handlerWrapper),
-		packetChan:          make(chan *Packet, 256),
-		errorChan:           make(chan error, 10),
-		ctx:                 ctx,
-		cancel:              cancel,
-		hideErrors:          config.HideErrors,
+	c := &Client{
+		host:                 config.Host,
+		port:                 config.Port,
+		version:              config.Version,
+		protocolVer:          config.ProtocolVersion,
+		state:                states.Handshaking,
 		compressionThreshold: config.CompressionThreshold,
-		packetRegistry:      NewPacketRegistry(config.Version),
-		nextHandlerID:       1,
+		events:               event.NewBus(),
+		handlers:             make(map[states.State]map[int32][]*handlerWrapper),
+		ctx:                  ctx,
+		cancel:               cancel,
+		incoming:             make(chan *Packet, 256),
+		readLoopDone:         make(chan struct{}),
+		nextID:               1,
 	}
+
+	// Initialize handler maps for all states
+	c.handlers[states.Handshaking] = make(map[int32][]*handlerWrapper)
+	c.handlers[states.Status] = make(map[int32][]*handlerWrapper)
+	c.handlers[states.Login] = make(map[int32][]*handlerWrapper)
+	c.handlers[states.Play] = make(map[int32][]*handlerWrapper)
+
+	return c
 }
 
-// Connect connects to a Minecraft server.
-//
-// This establishes a TCP connection and starts the read loop.
-// The connection handshake is not performed automatically.
-func (c *Client) Connect(ctx context.Context, host string, port int) error {
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
+// Connect establishes a connection to the server.
+func (c *Client) Connect(ctx context.Context) error {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 
-	c.host = host
-	c.port = port
-
-	// Establish TCP connection
-	address := fmt.Sprintf("%s:%d", host, port)
-	dialer := net.Dialer{}
-
-	conn, err := dialer.DialContext(ctx, "tcp", address)
-	if err != nil {
-		return fmt.Errorf("failed to connect to %s: %w", address, err)
+	if c.conn != nil {
+		return ErrAlreadyConnected
 	}
 
-	c.conn = conn
-	c.connState.SetState(Handshaking)
+	// Create connection
+	c.conn = conn.NewConn(conn.Config{
+		Host:                 c.host,
+		Port:                 c.port,
+		CompressionThreshold: c.compressionThreshold,
+	})
 
-	// Initialize serializer/deserializer for current state
-	c.initSerializerDeserializer()
+	// Connect to server
+	if err := c.conn.Connect(ctx); err != nil {
+		c.conn = nil
+		return err
+	}
+
+	// Enable compression if threshold is set
+	if c.compressionThreshold > 0 {
+		c.conn.EnableCompression(c.compressionThreshold)
+	}
 
 	// Start read loop
 	c.wg.Add(1)
@@ -126,147 +135,53 @@ func (c *Client) Connect(ctx context.Context, host string, port int) error {
 }
 
 // Disconnect closes the connection to the server.
-// FIXED: Use instance variable instead of package variable
-func (c *Client) Disconnect(reason string) {
-	c.connMu.Lock()
-	conn := c.conn
-	c.connMu.Unlock()
+func (c *Client) Disconnect() error {
+	c.stateMu.Lock()
 
-	if conn == nil {
-		return
+	if c.conn == nil {
+		c.stateMu.Unlock()
+		return ErrNotConnected
 	}
 
-	// Cancel context first to stop goroutines
+	// Cancel context to stop goroutines
 	c.cancel()
 
-	// Close the connection
-	if err := conn.Close(); err != nil && !c.hideErrors {
-		// Could log error here
-	}
+	c.stateMu.Unlock()
 
-	// Wait for goroutines to finish
+	// Wait for read loop to finish
+	<-c.readLoopDone
 	c.wg.Wait()
 
-	c.connMu.Lock()
+	// Close connection
+	c.stateMu.Lock()
+	err := c.conn.Close()
 	c.conn = nil
-	c.connMu.Unlock()
+	c.stateMu.Unlock()
 
-	c.emit("end", reason)
+	return err
 }
 
 // State returns the current protocol state.
-func (c *Client) State() State {
+func (c *Client) State() states.State {
 	c.stateMu.RLock()
 	defer c.stateMu.RUnlock()
 	return c.state
 }
 
-// SetState changes the protocol state and reinitializes serializer/deserializer.
-func (c *Client) SetState(newState State) error {
+// SetState changes the protocol state.
+func (c *Client) SetState(state states.State) error {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 
-	if !c.state.CanTransitionTo(newState) {
+	if !c.state.CanTransitionTo(state) {
 		return ErrInvalidState
 	}
 
 	oldState := c.state
-	c.state = newState
+	c.state = state
 
-	// Update connection state
-	if err := c.connState.SetState(newState); err != nil {
-		return err
-	}
-
-	// Reinitialize serializer/deserializer for new state
-	c.initSerializerDeserializer()
-
-	c.emit("state", newState, oldState)
-	return nil
-}
-
-// On registers a packet handler for a specific packet name.
-//
-// The handler will be called whenever a packet with this name is received.
-// Multiple handlers can be registered for the same packet.
-func (c *Client) On(packetName string, handler PacketHandler) Subscription {
-	c.handlersMu.Lock()
-	defer c.handlersMu.Unlock()
-
-	if c.handlers[packetName] == nil {
-		c.handlers[packetName] = make([]*handlerWrapper, 0)
-	}
-
-	// FIXED: Use wrapper with unique ID for proper removal
-	wrapper := &handlerWrapper{
-		id:      c.nextHandlerID,
-		handler: handler,
-	}
-	c.nextHandlerID++
-
-	c.handlers[packetName] = append(c.handlers[packetName], wrapper)
-
-	return &clientSubscription{
-		client: c,
-		name:   packetName,
-		id:     wrapper.id,
-	}
-}
-
-// Write writes a packet to the server.
-//
-// The packet is serialized, compressed (if enabled), encrypted (if enabled),
-// and sent to the server.
-func (c *Client) Write(packetName string, data map[string]interface{}) error {
-	c.connMu.Lock()
-	conn := c.conn
-	c.connMu.Unlock()
-
-	if conn == nil {
-		return ErrBotNotConnected
-	}
-
-	packet := NewPacket(packetName, data)
-
-	c.stateMu.RLock()
-	packet.State = c.state
-	c.stateMu.RUnlock()
-
-	// Serialize the packet
-	buffer, err := c.serializer.Serialize(packet)
-	if err != nil {
-		return fmt.Errorf("failed to serialize packet %s: %w", packetName, err)
-	}
-
-	packet.Buffer = buffer
-
-	// Apply compression
-	if c.compressor != nil {
-		compressed, err := c.compressor.Compress(buffer)
-		if err != nil {
-			return fmt.Errorf("compression error: %w", err)
-		}
-		buffer = compressed
-	}
-
-	// Apply encryption
-	if c.encryptor != nil {
-		encrypted, err := c.encryptor.Encrypt(buffer)
-		if err != nil {
-			return fmt.Errorf("encryption error: %w", err)
-		}
-		buffer = encrypted
-	}
-
-	// Write length prefix (VarInt) + data
-	length := len(buffer)
-	lengthBuf := make([]byte, varIntByteCount(uint32(length)))
-	writeVarInt(lengthBuf, uint32(length))
-
-	_, err = conn.Write(append(lengthBuf, buffer...))
-	if err != nil {
-		return fmt.Errorf("write error: %w", err)
-	}
+	// Emit state change event
+	c.events.Emit("state", c.state, oldState)
 
 	return nil
 }
@@ -274,7 +189,7 @@ func (c *Client) Write(packetName string, data map[string]interface{}) error {
 // readLoop reads packets from the connection in a loop.
 func (c *Client) readLoop() {
 	defer c.wg.Done()
-	defer close(c.packetChan)
+	defer close(c.readLoopDone)
 
 	for {
 		select {
@@ -283,303 +198,245 @@ func (c *Client) readLoop() {
 		default:
 			packet, err := c.readPacket()
 			if err != nil {
-				select {
-				case c.errorChan <- err:
-				case <-c.ctx.Done():
+				if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
+					// Emit error event
+					c.events.Emit("error", err)
 				}
 				return
 			}
 
-			// Emit the packet
-			c.emitPacket(packet)
+			// Emit packet event
+			c.events.Emit("packet", packet)
+
+			// Send to incoming channel
+			select {
+			case c.incoming <- packet:
+			case <-c.ctx.Done():
+				return
+			}
 		}
 	}
 }
 
 // readPacket reads a single packet from the connection.
 func (c *Client) readPacket() (*Packet, error) {
-	c.connMu.Lock()
-	conn := c.conn
-	c.connMu.Unlock()
-
-	if conn == nil {
-		return nil, ErrBotNotConnected
-	}
-
-	// Set read deadline
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	defer conn.SetReadDeadline(time.Time{}) // Clear deadline
-
 	// Read packet length (VarInt)
-	length, err := readVarInt(conn)
+	reader := codec.NewReader(c.conn)
+	length, err := reader.ReadVarInt()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read packet length: %w", err)
 	}
 
-	if length <= 0 || length > 0x200000 { // Max 2MB
+	if length < 0 {
 		return nil, fmt.Errorf("invalid packet length: %d", length)
 	}
 
+	// Sanity check: limit packet size to 2MB
+	if length > 0x200000 {
+		return nil, fmt.Errorf("packet too large: %d bytes", length)
+	}
+
 	// Read packet data
-	buffer := make([]byte, length)
-	_, err = io.ReadFull(conn, buffer)
+	data := make([]byte, length)
+	_, err = io.ReadFull(c.conn, data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read packet data: %w", err)
 	}
 
-	// Decrypt
-	if c.encryptor != nil {
-		buffer, err = c.encryptor.Decrypt(buffer)
+	// Handle compression
+	if c.compressionThreshold > 0 {
+		data, err = c.decompressPacket(data)
 		if err != nil {
-			return nil, fmt.Errorf("decryption error: %w", err)
+			return nil, fmt.Errorf("failed to decompress packet: %w", err)
 		}
 	}
 
-	// Decompress
-	if c.compressor != nil {
-		buffer, err = c.compressor.Decompress(buffer)
-		if err != nil {
-			return nil, fmt.Errorf("decompression error: %w", err)
-		}
-	}
-
-	// Deserialize
-	packet, err := c.deserializer.Deserialize(buffer)
+	// Read packet ID
+	buf := bytes.NewBuffer(data)
+	packetReader := codec.NewReader(buf)
+	packetID, err := packetReader.ReadVarInt()
 	if err != nil {
-		return nil, fmt.Errorf("deserialization error: %w", err)
+		return nil, fmt.Errorf("failed to read packet ID: %w", err)
 	}
 
+	// Get current state
 	c.stateMu.RLock()
-	packet.State = c.state
+	state := c.state
 	c.stateMu.RUnlock()
+
+	// Create packet
+	packet := &Packet{
+		ID:        packetID,
+		State:     state,
+		Direction: states.Clientbound,
+		Data:      data,
+		Fields:    make(map[string]interface{}),
+	}
 
 	return packet, nil
 }
 
-// emitPacket emits a packet to all registered handlers.
-// FIXED: Limit concurrent goroutines and properly handle handlers
-func (c *Client) emitPacket(packet *Packet) {
-	// Emit generic packet event
-	c.emit("packet", packet)
+// decompressPacket decompresses a packet if it's compressed.
+func (c *Client) decompressPacket(data []byte) ([]byte, error) {
+	buf := bytes.NewReader(data)
+	reader := codec.NewReader(buf)
 
-	c.handlersMu.RLock()
-	handlers := c.handlers[packet.Name]
-	// Copy handlers to avoid holding lock
-	handlersCopy := make([]*handlerWrapper, len(handlers))
-	copy(handlersCopy, handlers)
-	c.handlersMu.RUnlock()
-
-	if len(handlersCopy) == 0 {
-		return
+	// Read data length (VarInt)
+	// 0 means uncompressed, >0 means compressed
+	dataLength, err := reader.ReadVarInt()
+	if err != nil {
+		return nil, err
 	}
 
-	// FIXED: Spawn goroutines with proper panic recovery
-	for _, wrapper := range handlersCopy {
-		go func(h PacketHandler) {
-			defer func() {
-				if r := recover(); r != nil && !c.hideErrors {
-					// Could log panic here
-				}
-			}()
-			h(packet)
-		}(wrapper.handler)
+	if dataLength == 0 {
+		// Uncompressed, return remaining data
+		remaining := make([]byte, buf.Len())
+		_, err = buf.Read(remaining)
+		return remaining, err
 	}
+
+	// Compressed, decompress
+	compressedData := make([]byte, buf.Len())
+	_, err = buf.Read(compressedData)
+	if err != nil {
+		return nil, err
+	}
+
+	// Decompress using zlib
+	r, err := zlib.NewReader(bytes.NewReader(compressedData))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	decompressed := make([]byte, dataLength)
+	_, err = io.ReadFull(r, decompressed)
+	if err != nil {
+		return nil, err
+	}
+
+	return decompressed, nil
 }
 
-// emit emits an event with data.
-func (c *Client) emit(event string, data ...interface{}) {
-	c.handlersMu.RLock()
-	handlers := c.handlers[event]
-	// Copy handlers
-	handlersCopy := make([]*handlerWrapper, len(handlers))
-	copy(handlersCopy, handlers)
-	c.handlersMu.RUnlock()
-
-	if len(handlersCopy) == 0 {
-		return
-	}
-
-	for _, wrapper := range handlersCopy {
-		go func(h PacketHandler) {
-			defer func() {
-				if r := recover(); r != nil {
-					// Recover from panic
-				}
-			}()
-
-			// Create a fake packet for non-packet events
-			if event == "packet" && len(data) > 0 {
-				if packet, ok := data[0].(*Packet); ok {
-					h(packet)
-					return
-				}
-			}
-
-			// For other events, create a fake packet
-			h(&Packet{Name: event, Data: map[string]interface{}{"data": data}})
-		}(wrapper.handler)
-	}
-}
-
-// initSerializerDeserializer initializes serializer and deserializer for current state.
-func (c *Client) initSerializerDeserializer() {
-	// TODO: Initialize based on protocol state and version
-	// This will be implemented when serializer/deserializer are complete
+// Write writes a packet to the server.
+func (c *Client) Write(packet *Packet) error {
 	c.stateMu.RLock()
-	state := c.state
-	version := c.version
+	conn := c.conn
 	c.stateMu.RUnlock()
 
-	c.serializer = NewSerializer(version, state)
-	c.deserializer = NewDeserializer(version, state, c.packetRegistry)
-}
-
-// Version returns the Minecraft version string.
-func (c *Client) Version() string {
-	return c.version
-}
-
-// ProtocolVersion returns the protocol version number.
-func (c *Client) ProtocolVersion() int {
-	c.stateMu.RLock()
-	defer c.stateMu.RUnlock()
-	return c.protocolVersion
-}
-
-// Latency returns the current network latency (ping).
-func (c *Client) Latency() time.Duration {
-	return c.latency
-}
-
-// SetCompressionThreshold sets the compression threshold.
-// Packets larger than this size will be compressed.
-func (c *Client) SetCompressionThreshold(threshold int) error {
-	if threshold < 0 {
-		// Disable compression
-		c.compressor = nil
-		return nil
+	if conn == nil {
+		return ErrNotConnected
 	}
 
-	// Initialize compressor
-	c.compressor = NewCompressor(threshold)
+	// Serialize packet
+	data, err := c.serializePacket(packet)
+	if err != nil {
+		return fmt.Errorf("failed to serialize packet: %w", err)
+	}
+
+	// Apply compression if enabled
+	if c.compressionThreshold > 0 {
+		data, err = c.compressPacket(data)
+		if err != nil {
+			return fmt.Errorf("failed to compress packet: %w", err)
+		}
+	}
+
+	// Write length prefix + data
+	lengthBuf := make([]byte, 0)
+	length := codec.VarIntSize(int32(len(data)))
+	lengthBuf = make([]byte, length)
+	codec.WriteVarInt(lengthBuf[:0], int32(len(data)))
+
+	fullData := append(lengthBuf, data...)
+
+	_, err = conn.Write(fullData)
+	if err != nil {
+		return fmt.Errorf("failed to write packet: %w", err)
+	}
+
 	return nil
 }
 
-// EnableCompression enables packet compression.
-func (c *Client) EnableCompression(threshold int) error {
-	return c.SetCompressionThreshold(threshold)
+// serializePacket serializes a packet to bytes.
+func (c *Client) serializePacket(packet *Packet) ([]byte, error) {
+	buf := &bytes.Buffer{}
+	writer := codec.NewWriter(buf)
+
+	// Write packet ID
+	if err := writer.WriteVarInt(packet.ID); err != nil {
+		return nil, err
+	}
+
+	// Write packet data
+	if _, err := buf.Write(packet.Data); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
 }
 
-// DisableCompression disables packet compression.
-func (c *Client) DisableCompression() {
-	c.compressor = nil
+// compressPacket compresses a packet if it's large enough.
+func (c *Client) compressPacket(data []byte) ([]byte, error) {
+	if len(data) < c.compressionThreshold {
+		// Don't compress small packets
+		// Write data length as 0 (uncompressed)
+		buf := &bytes.Buffer{}
+		writer := codec.NewWriter(buf)
+		writer.WriteVarInt(0)
+		writer.WriteBytes(data)
+		return buf.Bytes(), nil
+	}
+
+	// Compress
+	var compressed bytes.Buffer
+	w := zlib.NewWriter(&compressed)
+	if _, err := w.Write(data); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+
+	// Write data length + compressed data
+	buf := &bytes.Buffer{}
+	writer := codec.NewWriter(buf)
+	writer.WriteVarInt(int32(len(data)))
+	writer.WriteBytes(compressed.Bytes())
+
+	return buf.Bytes(), nil
 }
 
-// EnableEncryption enables packet encryption with the given key.
-func (c *Client) EnableEncryption(key []byte) error {
-	var err error
-	c.encryptor, err = NewEncryptor(key)
-	return err
+// On registers a packet handler.
+func (c *Client) On(packetID int32, handler PacketHandler) {
+	c.handlersMu.Lock()
+	defer c.handlersMu.Unlock()
+
+	c.stateMu.RLock()
+	state := c.state
+	c.stateMu.RUnlock()
+
+	wrapper := &handlerWrapper{
+		id:      c.nextID,
+		handler: handler,
+	}
+	c.nextID++
+
+	c.handlers[state][packetID] = append(c.handlers[state][packetID], wrapper)
 }
 
-// DisableEncryption disables packet encryption.
-func (c *Client) DisableEncryption() {
-	c.encryptor = nil
-}
-
-// handlerWrapper wraps a packet handler with a unique ID for removal.
-// FIXED: This solves the function comparison problem
+// handlerWrapper wraps a handler with a unique ID.
 type handlerWrapper struct {
 	id      uint64
 	handler PacketHandler
 }
 
-// clientSubscription implements Subscription for client handlers.
-type clientSubscription struct {
-	client *Client
-	name   string
-	id     uint64
+// Events returns the event bus.
+func (c *Client) Events() *event.Bus {
+	return c.events
 }
 
-// Unsubscribe removes the packet handler.
-// FIXED: Now properly identifies the handler by ID
-func (s *clientSubscription) Unsubscribe() {
-	s.client.handlersMu.Lock()
-	defer s.client.handlersMu.Unlock()
-
-	handlers := s.client.handlers[s.name]
-	if handlers == nil {
-		return
-	}
-
-	// Find and remove the handler by ID
-	for i, wrapper := range handlers {
-		if wrapper.id == s.id {
-			// Remove by swapping with last and shrinking
-			last := len(handlers) - 1
-			handlers[i] = handlers[last]
-			handlers[last] = nil
-			s.client.handlers[s.name] = handlers[:last]
-			return
-		}
-	}
-}
-
-// Helper functions for VarInt
-
-func varIntByteCount(value uint32) int {
-	if value == 0 {
-		return 1
-	}
-
-	count := 0
-	for {
-		count++
-		value >>= 7
-		if value == 0 {
-			break
-		}
-	}
-	return count
-}
-
-func writeVarInt(buf []byte, value uint32) {
-	i := 0
-	for {
-		temp := byte(value & 0x7F)
-		value >>= 7
-		if value != 0 {
-			temp |= 0x80
-		}
-		buf[i] = temp
-		i++
-		if value == 0 {
-			break
-		}
-	}
-}
-
-func readVarInt(r io.Reader) (int, error) {
-	var result uint32
-	var shift uint
-
-	for {
-		buf := make([]byte, 1)
-		_, err := io.ReadFull(r, buf)
-		if err != nil {
-			return 0, err
-		}
-
-		b := buf[0]
-		result |= uint32(b&0x7F) << shift
-
-		if (b & 0x80) == 0 {
-			return int(result), nil
-		}
-
-		shift += 7
-		if shift >= 35 {
-			return 0, fmt.Errorf("VarInt too big")
-		}
-	}
+// Incoming returns the incoming packet channel.
+func (c *Client) Incoming() <-chan *Packet {
+	return c.incoming
 }
